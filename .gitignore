@@ -75,7 +75,10 @@ logs/
 *.bak
 
 # Data files (uncomment if you don't want to track large data files)
-# *.ply
+*.ply
+transforms_video.json
+test*
+*.mp4
 # *.obj
 # *.pkl
 # *.npz
