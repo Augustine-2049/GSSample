@@ -2,7 +2,9 @@
 
 // 1. 定义输入和输出类型
 layout (points) in; // 输入是一个点
-layout (triangle_strip, max_vertices = 4) out; // 输出是一个最多4个顶点的三角带
+// layout (triangle_strip, max_vertices = 4) out; // 输出是一个最多4个顶点的三角带
+layout (triangle_strip, max_vertices = 4) out;
+
 
 // 接收来自顶点着色器的数据
 in VS_OUT {
@@ -17,7 +19,7 @@ out vec3 f_scale;
 out vec4 f_rotate;
 
 // uniform变量，用于从Python控制方形的大小
-uniform float point_size; // 这里的size是在裁剪空间中的大小
+uniform float elem_size; // 这里的size是在裁剪空间中的大小
 
 
 
@@ -36,19 +38,19 @@ void main() {
     f_rotate = u_rotation;
 
     f_color = color_val;
-    gl_Position = center_pos + vec4(-point_size, -point_size, 0.0, 0.0);
+    gl_Position = center_pos + vec4(-elem_size, -elem_size, 0.0, 0.0);
     EmitVertex(); // 发射第一个顶点
 
     // 左上
-    gl_Position = center_pos + vec4(-point_size, point_size, 0.0, 0.0);
+    gl_Position = center_pos + vec4(-elem_size, elem_size, 0.0, 0.0);
     EmitVertex(); // 发射第二个顶点
 
     // 右下
-    gl_Position = center_pos + vec4(point_size, -point_size, 0.0, 0.0);
+    gl_Position = center_pos + vec4(elem_size, -elem_size, 0.0, 0.0);
     EmitVertex(); // 发射第三个顶点
 
     // 右上
-    gl_Position = center_pos + vec4(point_size, point_size, 0.0, 0.0);
+    gl_Position = center_pos + vec4(elem_size, elem_size, 0.0, 0.0);
     EmitVertex(); // 发射第四个顶点
 
 

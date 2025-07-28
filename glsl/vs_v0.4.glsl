@@ -10,6 +10,7 @@ in vec3 in_vert;
 in vec3 in_color;
 in vec3 in_scale;
 in vec4 in_rotate;
+in float in_opacity;
 in vec2 in_rand_seed;
 
 
@@ -81,10 +82,16 @@ void main() {
     float ratio = scale / scale_max;
     float scaled_instances = ratio * float(MAX_INSTANCES);
     int point_num = int(max(scaled_instances, 1.0));
-    if(gl_InstanceID - 10 > point_num){
+    if(gl_InstanceID + 1 > point_num){
         gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
         return;
     }
+    point_num = int(max(in_opacity * float(MAX_INSTANCES), 1.0));
+    if(gl_InstanceID + 1 > point_num){
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        return;
+    }
+
     vec4 u_rotation = in_rotate;
     // --- 2. 在椭球内生成随机偏移向量 ---
     // a. 创建一个独一无二的随机种子

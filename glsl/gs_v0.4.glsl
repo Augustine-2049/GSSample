@@ -24,10 +24,6 @@ void main() {
     gl_Position = gl_in[0].gl_Position;
     f_color = gs_in[0].color;
 
-    // 在裁剪空间中计算四边形的四个角点
-    // 注意：gl_Position的w分量用于透视除法，这里需要保持一致
-    // 我们在xy平面上扩展，大小为 point_size
-
     EmitVertex(); // 发射第一个顶点
 
 

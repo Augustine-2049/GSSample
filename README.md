@@ -15,8 +15,11 @@
 
 20250726
 - 服务器部署3dgs，跑bicycle得到1E8的场景
-- 硬光栅管线
+- 硬光栅
     - 实现GLSL渲染直出视频，1E6个点，245fps
+    - 1080p -> 60fps
+    - 点分裂
+- point_render.py后续测试CPU下的正确性，point_render_pipeline.py用于测试GLSL管线
 
 
 ## 部署
