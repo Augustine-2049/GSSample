@@ -1,6 +1,7 @@
 '''
-v0.4:
-    1. 这里开始只运行0.4以上版本
+v0.1-v0.3:
+    1. 使用几何着色器，实现点云的实例化渲染
+    2. 实现部分v0.4功能，不过这里建议不看0.4代码，只运行0.1-0.3，不维护了。
 
 1. zip_point_cloud:
     读取3DGS点云，并压缩，存储在point_cloud_zip.ply
@@ -36,19 +37,12 @@ ROOT_DIR = Path(__file__).parent  # 向上两级到 GSSample/
 sys.path.append(str(ROOT_DIR))  # 将根目录加入 Python 路径
 mode = "GPU"
 FPS = 10
-# 200(k) 1000 = 30%black，28fps
-# 200 1000 = 27%black, 12fps, no filter
-# 2000 100 = 37%black, 14fps
-# 2000 10 = 75%black 29fps
-# 2000 10 = 50%black 29fps, no filter
-NUM_POINTS_TO_KEEP = 1_000_000  # 3_000_000
-NUM_SAMPLES_PER_POINT = 256
+NUM_POINTS_TO_KEEP = 1_000_000
+NUM_SAMPLES_PER_POINT = 10
 SCALE_CEIL = 5E-5
 OPACITY_CEIL = 0.5
-SCALE_CEIL = 5E-3
-OPACITY_CEIL = 1
 USE_HALF_PRECISION = False
-version = 0.5
+version = 0.4
 
 # 导入log系统，设置日志输出位置
 import logging
@@ -229,6 +223,9 @@ def get_video_cam_info_from_bin(
         c2w_cv[:3, :3] = R_cw
         c2w_cv[:3, 3] = t_cw
         
+        # =================================================================
+        #                      >>> 核心修复在这里 <<<
+        # =================================================================
         
         # --- 步骤 2: 定义从 OpenCV 到 OpenGL 相机坐标系的转换矩阵 ---
         # 这个转换在相机的局部空间中进行，翻转 Y 和 Z 轴
@@ -317,18 +314,21 @@ def render_pipeline(
         log_info(f"frag_shader: {frag_shader}")
     geom_shader = None
 
-    # 在渲染循环中设置 point_size
-    # 这个值需要非常小，因为它是在-1到1的裁剪空间中
-    # 比如 0.01 对应屏幕尺寸的 1%
-    with open(os.path.join(path, 'glsl', f'gs_v{version:.1f}.glsl'), 'r', encoding="utf-8") as f:
-        geom_shader = f.read()
-        log_info(f"geom_shader: {geom_shader}")
-    prog = ctx.program(vertex_shader=vert_shader, 
-                    geometry_shader=geom_shader,
-                    fragment_shader=frag_shader,
-                    # varyings=['captured_gl_position']
-    )
-
+    if version < 0.2:
+        prog = ctx.program(vertex_shader=vert_shader, 
+                        fragment_shader=frag_shader)
+    elif version >= 0.2:
+        # 在渲染循环中设置 point_size
+        # 这个值需要非常小，因为它是在-1到1的裁剪空间中
+        # 比如 0.01 对应屏幕尺寸的 1%
+        with open(os.path.join(path, 'glsl', f'gs_v{version:.1f}.glsl'), 'r', encoding="utf-8") as f:
+            geom_shader = f.read()
+            log_info(f"geom_shader: {geom_shader}")
+        prog = ctx.program(vertex_shader=vert_shader, 
+                        geometry_shader=geom_shader,
+                        fragment_shader=frag_shader,
+                        # varyings=['captured_gl_position']
+        )
 
     # --- step 4: 加载和预处理点云数据 ---
     log_info("--- step 4: load point cloud data ---")
@@ -345,7 +345,7 @@ def render_pipeline(
     opacity_max = np.max(opacity)
     opacity_min = np.min(opacity)
     log_info(f"opacity_max: {opacity_max}, opacity_min: {opacity_min}")
-    point_num = len(points_world)
+    log_info(f"point num: {len(points_world)}")
     # 统计scale > scale_max 和 opacity > opacity_max 的点数
     scale_max_cnt = np.sum(scale > SCALE_CEIL)
     opacity_max_cnt = np.sum(opacity > OPACITY_CEIL)
@@ -359,27 +359,11 @@ def render_pipeline(
     cnt_zero = np.sum(cnt == 0)
     cnt_max = np.sum(cnt >= NUM_SAMPLES_PER_POINT)
     cnt_total = len(cnt)
-
+    
+    log_info(f"cnt == 0: {cnt_zero} ({cnt_zero/cnt_total*100:.2f}%)")
+    log_info(f"cnt >= {NUM_SAMPLES_PER_POINT}: {cnt_max} ({cnt_max/cnt_total*100:.2f}%)")
+    log_info(f"cnt in (0, {NUM_SAMPLES_PER_POINT}): {cnt_total - cnt_zero - cnt_max} ({(cnt_total - cnt_zero - cnt_max)/cnt_total*100:.2f}%)")
     cnt[cnt == 0] = 1
-
-
-    # # --- step 3.5: 编译视锥体裁剪的计算着色器 ---
-    # with open(os.path.join(path, 'glsl', f'cs_v{version:.1f}.glsl'), 'r', encoding="utf-8") as f:
-    #     cull_shader_code = f.read()
-    #     log_info(f"cull_shader_code: {cull_shader_code}")
-    # prog_cull = ctx.compute_shader(cull_shader_code)
-
-    
-    # # 准备用于裁剪的 SSBO (需要 vec4)
-    # points_world_vec4 = np.hstack([points_world, np.ones((point_num, 1))]).astype('f4')
-    # ssbo_all_positions = ctx.buffer(points_world_vec4.tobytes())
-    # ssbo_cnt = ctx.buffer(cnt.astype('i4').tobytes())
-    
-    # # 创建用于存储裁剪结果的 SSBO
-    # # 命令缓冲区现在的大小是 point_num (最坏情况)
-    # indirect_cmd_buffer = ctx.buffer(reserve=point_num * 5 * 4) 
-    # ssbo_atomic_counter = ctx.buffer(data=np.array([0], dtype='u4').tobytes()) # 初始化为0
-
 
 
     # --- step 5 & 6: 创建并上传 VBOs ---
@@ -392,7 +376,6 @@ def render_pipeline(
     vbo_rotates = ctx.buffer(rotates.astype('f4').tobytes())
     vbo_opacity = ctx.buffer(opacity.astype('f4').tobytes())
     vbo_cnt = ctx.buffer(cnt.astype('i4').tobytes())
-    # ssbo_cnt = ctx.buffer(cnt.astype('i4').tobytes()) # 创建一个 SSBO
     # --- step 6: 创建 VAO ---
     log_info("--- step 6: bind buffer to shader input ---")
     # 将缓冲区绑定到着色器的输入
@@ -404,121 +387,57 @@ def render_pipeline(
         # (vbo_opacity, '1f', 'in_opacity'),
         (vbo_cnt, '1i', 'in_cnt'),
     ]   
-    vbo_random_seeds = ctx.buffer(np.random.rand(len(points_world), 2).astype('f4').tobytes())
-    vao_content.append((vbo_random_seeds, '2f', 'in_rand_seed'))
+    if version >= 0.3:
+        vbo_random_seeds = ctx.buffer(np.random.rand(len(points_world), 2).astype('f4').tobytes())
+        vao_content.append((vbo_random_seeds, '2f', 'in_rand_seed'))
 
     vao_main = ctx.vertex_array(prog, vao_content)
 
+    # --- step 7: 创建渲染目标 (FBOs) ---
+    log_info("--- step 7: create frame buffer object (FBO) ---")
+    if version <= 0.3:
+        fbo = ctx.framebuffer(
+            ctx.renderbuffer((img_width, img_height)),
+            ctx.depth_renderbuffer((img_width, img_height))
+        )
+        fbo.use()
+    else:
+        # Pass 1 的渲染目标：一个带 RGBA 纹理的 FBO
+        # 这个纹理将保存带有空洞的原始渲染结果
+        texture_pass1 = ctx.texture((img_width, img_height), 4, dtype='f1') # f1 = 8-bit, f4 = 32-bit float
+        depth_pass1 = ctx.depth_renderbuffer((img_width, img_height))
+        fbo_pass1 = ctx.framebuffer(color_attachments=[texture_pass1], depth_attachment=depth_pass1)
+        # Pass 2 的渲染目标：一个只带 RGB Renderbuffer 的 FBO
+        # 这是我们的最终输出目标，我们直接从这里读取最终图像
+        # 用 Renderbuffer 比用 Texture 更高效，因为我们不需要再对它进行采样
+        color_pass2 = ctx.renderbuffer((img_width, img_height), 3) # RGB
+        fbo_pass2 = ctx.framebuffer(color_attachments=[color_pass2])        
+        with open(os.path.join(path, 'glsl', f'postproc_vs_v{version:.1f}.glsl'), 'r', encoding="utf-8") as f:
+            postproc_vert_shader = f.read()
+            log_info(f"postproc_vert_shader: {postproc_vert_shader}")
+        with open(os.path.join(path, 'glsl', f'postproc_fs_v{version:.1f}.glsl'), 'r', encoding="utf-8") as f:
+            postproc_frag_shader = f.read()
+            log_info(f"postproc_frag_shader: {postproc_frag_shader}")
+        postproc_prog = ctx.program(vertex_shader=postproc_vert_shader,
+                                    fragment_shader=postproc_frag_shader)
+        postproc_vao = ctx.vertex_array(postproc_prog, [
+            (ctx.buffer(np.array([[-1, -1], [1, -1], [-1, 1], [1, 1]], dtype=np.float32).tobytes()), '2f', 'in_vert')
+        ])
 
-
-
-    # --- step7，创建计算着色器和间接绘制缓冲区 ---
-    # 计算着色器，用于生成绘制命令
-    # with open(os.path.join(path, 'glsl', f'cs_v{version:.1f}.glsl'), 'r', encoding="utf-8") as f:
-    #     compute_shader_code = f.read()
-    # compute_prog = ctx.compute_shader(compute_shader_code)
-    # # 间接绘制命令缓冲区
-    # # 每个命令是 5 * 4 = 20 字节 (count, instanceCount, first, baseInstance, baseVertex)
-    # # 我们使用 MultiDrawArraysIndirect，所以需要 N 个命令
-    # indirect_cmd_buffer = ctx.buffer(reserve=point_num * 5 * 4)
-    # log_info("--- Running Pass 0 (Compute Shader) to generate indirect commands ONCE ---")
-    
-    
-    # # 绑定 SSBOs
-    # ssbo_cnt.bind_to_storage_buffer(0)
-    # indirect_cmd_buffer.bind_to_storage_buffer(1)
-    
-    # # 设置 uniforms 并运行计算着色器
-    # compute_prog['u_point_count'].value = point_num
-    # work_groups_x = (point_num + 1023) // 1024
-    # compute_prog.run(group_x=work_groups_x)
-    
-    # # **确保计算着色器执行完毕**
-    # ctx.finish() 
-    # log_info("--- Indirect command buffer generated. ---")
-
-
-
-
-    # --- step 8 : 创建渲染目标 (FBOs) ---
-    log_info("--- step 8: create frame buffer object (FBO) ---")
-
-
-    # Pass 1 的渲染目标：一个带 RGBA 纹理的 FBO
-    # 这个纹理将保存带有空洞的原始渲染结果
-    texture_pass1 = ctx.texture((img_width, img_height), 4, dtype='f1') # f1 = 8-bit, f4 = 32-bit float
-    depth_pass1 = ctx.depth_renderbuffer((img_width, img_height))
-    fbo_pass1 = ctx.framebuffer(color_attachments=[texture_pass1], depth_attachment=depth_pass1)
-    # Pass 2 的渲染目标：一个只带 RGB Renderbuffer 的 FBO
-    # 这是我们的最终输出目标，我们直接从这里读取最终图像
-    # 用 Renderbuffer 比用 Texture 更高效，因为我们不需要再对它进行采样
-    color_pass2 = ctx.renderbuffer((img_width, img_height), 3) # RGB
-    fbo_pass2 = ctx.framebuffer(color_attachments=[color_pass2])        
-    with open(os.path.join(path, 'glsl', f'postproc_vs_v{version:.1f}.glsl'), 'r', encoding="utf-8") as f:
-        postproc_vert_shader = f.read()
-        log_info(f"postproc_vert_shader: {postproc_vert_shader}")
-    with open(os.path.join(path, 'glsl', f'postproc_fs_v{version:.1f}.glsl'), 'r', encoding="utf-8") as f:
-        postproc_frag_shader = f.read()
-        log_info(f"postproc_frag_shader: {postproc_frag_shader}")
-    postproc_prog = ctx.program(vertex_shader=postproc_vert_shader,
-                                fragment_shader=postproc_frag_shader)
-    postproc_vao = ctx.vertex_array(postproc_prog, [
-        (ctx.buffer(np.array([[-1, -1], [1, -1], [-1, 1], [1, 1]], dtype=np.float32).tobytes()), '2f', 'in_vert')
-    ])
-
-    # --- step 9: 加载相机数据 ---
-    log_info("--- step 9: load camera data ---")
+    # --- step 8: 加载相机数据 ---
+    log_info("--- step 8: load camera data ---")
     scene_dir = r"G:\Lab\NGSassist\data\bicycle"
     fov_x, fov_y, cam_poses = get_video_cam_info_from_bin(scene_dir, img_width, img_height)
     aspect_ratio = img_width / img_height
     znear, zfar = 0.01, 100.0
     projection_matrix = build_projection_matrix(fov_x, fov_y, aspect_ratio, znear, zfar)
 
-    # --- step 10: 准备视频写入器 ---
-    log_info("--- step 10: start render ---")
-    # video_path = os.path.join(output_dir, "render_video.mp4")
-    # fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
-    # # 注意：cv2的尺寸是 (宽, 高)
-    # video_writer = cv2.VideoWriter(video_path, fourcc, fps, (img_width, img_height)) # 30是帧率
-
-    # --- step 10.b: 尝试消费者线程 ---
-    from queue import Queue
-    from threading import Thread
-    # 创建一个线程安全的队列，设置一个最大尺寸以防止内存爆炸
+    # --- step 9: 准备视频写入器 ---
+    log_info("--- step 9: start render ---")
     video_path = os.path.join(output_dir, "render_video.mp4")
-    frame_queue = Queue(maxsize=360) 
-    
-    def video_writer_worker(queue, video_path, width, height, fps):
-        """一个在独立线程中运行的消费者函数"""
-        video_writer = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
-        while True:
-            # 从队列中获取数据，如果队列为空，会阻塞等待
-            item = queue.get()
-            # 收到结束信号 (None)
-            if item is None:
-                break
-            
-            image_bytes, img_h, img_w = item
-            
-            # --- 在这个线程中执行所有耗时的 CPU 操作 ---
-            image_np_rgb = np.frombuffer(image_bytes, dtype=np.uint8).reshape((img_h, img_w, 3))
-            image_np_bgr = cv2.cvtColor(np.flipud(image_np_rgb), cv2.COLOR_RGB2BGR)
-            video_writer.write(image_np_bgr)
-            
-            # 通知队列，一个任务已完成
-            queue.task_done()
-            
-        video_writer.release()
-        print("Video writer thread finished.")
-    # 启动消费者线程
-    writer_thread = Thread(target=video_writer_worker, 
-                           args=(frame_queue, video_path, img_width, img_height, fps))
-    writer_thread.start()
-
-    # 创建两个 CPU 端的字节缓冲区
-    cpu_buffers = [bytearray(img_width * img_height * 3) for _ in range(2)]
-    current_buffer_idx = 0
-    ###############################################################################################
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
+    # 注意：cv2的尺寸是 (宽, 高)
+    video_writer = cv2.VideoWriter(video_path, fourcc, fps, (img_width, img_height)) # 30是帧率
     start_time = time.time()
     # 设置时间uniform（如果存在）
     if 'u_time' in prog:
@@ -535,78 +454,60 @@ def render_pipeline(
     # 创建一个列表来存储耗时结果
     pass1_times = []
     pass2_times = []
-    black_pixels = 0.0
-    total_pixels = img_width * img_height
-    view_matrixs = []
-    for pose_c2w in cam_poses:
-        view_matrix = np.linalg.inv(pose_c2w)
-        view_matrixs.append(view_matrix)
-    proj_matrix = projection_matrix
-
 
     for idx, pose_c2w in enumerate(tqdm(cam_poses, desc="GPU render progress")):
-
-        # # --- pass0 视锥体裁剪 start ---
-        # # 1. 重置原子计数器
-        # ssbo_atomic_counter.write(np.array([0], dtype='u4'))
-        # # 3. 绑定 SSBOs
-        # ssbo_all_positions.bind_to_storage_buffer(0)
-        # ssbo_cnt.bind_to_storage_buffer(1)
-        # indirect_cmd_buffer.bind_to_storage_buffer(2)
-        # ssbo_atomic_counter.bind_to_storage_buffer(3)
-        # # 4. 设置 Uniforms
-        # prog_cull['u_proj_view'].write((proj_matrix @ view_matrixs[idx]).T.astype('f4').tobytes())
-        # prog_cull['u_total_points'].value = point_num
-        
-        # # 5. 运行计算着色器
-        # work_groups_x = (point_num + 1023) // 1024
-        # prog_cull.run(group_x=work_groups_x)
-        # # 6. 插入内存屏障，确保后续的渲染可以安全地读取 SSBO
-        # ctx.memory_barrier(moderngl.SHADER_STORAGE_BARRIER_BIT)
-        # # (可选，用于调试) 读回可见点数量
-        # num_visible_commands = np.frombuffer(ssbo_atomic_counter.read(), dtype='u4')[0]
-        # if idx % 50 == 0:
-        #     log_info(f"Frame {idx}: Visible commands: {num_visible_commands}")
-
-
-
-        # --- pass1 start ---
-        with query_pass1:
-            
-            # 告诉主渲染着色器，可见索引在哪里
-            # 设置 uniforms
-            # 注意：GLSL中矩阵乘法是右乘，所以需要转置
-            prog['view'].write(view_matrixs[idx].T.astype('f4').tobytes())
-            prog['projection'].write(proj_matrix.T.astype('f4').tobytes())
+        if version >= 0.4:
             fbo_pass1.use()  # 激活离屏FBO
             fbo_pass1.clear(0.0, 0.0, 0.0, 0.0)  # 透明黑清空
             # 启用 Alpha 混合，让片元着色器可以输出透明度
             ctx.enable(moderngl.BLEND) 
             ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
-            # 设置ctx.enable
-            ctx.enable(moderngl.DEPTH_TEST)
-            ctx.enable(moderngl.PROGRAM_POINT_SIZE)  # 启用 PROGRAM_POINT_SIZE 以便在 VS 中控制大小
+        else:
+            fbo.use() # 单通道直接渲染到屏幕
+            fbo.clear(0.0, 0.0, 0.0, 1.0)
+        # 设置ctx.enable
+        ctx.enable(moderngl.DEPTH_TEST)
+        ctx.enable(moderngl.PROGRAM_POINT_SIZE)
+
+        # 设置 uniforms
+        view_matrix = np.linalg.inv(pose_c2w)
+        proj_matrix = projection_matrix
+        # 注意：GLSL中矩阵乘法是右乘，所以需要转置
+        prog['view'].write(view_matrix.T.astype('f4').tobytes())
+        prog['projection'].write(proj_matrix.T.astype('f4').tobytes())
+        
+
+        # 根据版本执行渲染
+        if version == 0.1:
+            ctx.point_size = 3
+            vao_main.render(moderngl.POINTS)
+        elif version == 0.2:
+            # 设置点大小为最小
+            ctx.point_size = 10
+            prog['elem_size'].value = 0.01
+            # num_samples_per_point = 100
+            vao_main.render(moderngl.POINTS)
+        elif version >= 0.3:
+            # 启用 PROGRAM_POINT_SIZE 以便在 VS 中控制大小
+            ctx.enable(moderngl.PROGRAM_POINT_SIZE)
             ctx.point_size = 1
             # prog['elem_size'].value = 0.01
-            prog['MAX_INSTANCES'].value = NUM_SAMPLES_PER_POINT
-            vao_main.render(moderngl.POINTS, vertices=point_num, instances=NUM_SAMPLES_PER_POINT)
-            # vao_main.render_indirect(indirect_cmd_buffer, mode=moderngl.POINTS, count=num_visible_commands)
-        # **执行间接绘制**
-        # vao_main.render_indirect(indirect_cmd_buffer, mode=moderngl.POINTS)        
-        # --- pass1 end ---
+            num_samples_per_point = NUM_SAMPLES_PER_POINT
+            prog['MAX_INSTANCES'].value = num_samples_per_point
+            vao_main.render(moderngl.POINTS, instances=num_samples_per_point)
 
         # 统计纯黑像素数
-        # image_bytes = fbo_pass1.read(components=4, alignment=1)
-        # image_np_rgba = np.frombuffer(image_bytes, dtype=np.uint8).reshape((img_height, img_width, 4))
-        # black_pixels += np.sum(image_np_rgba[:, :, 3] == 0) / total_pixels
+        image_bytes = fbo_pass2.read(components=4)
+        image_np_rgba = np.frombuffer(image_bytes, dtype=np.uint8).reshape((img_height, img_width, 4))
+        black_pixels = np.sum(image_np_rgba[:, :, 3] == 0)
+        log_info(f"black pixels: {black_pixels}")
 
 
         # --- Pass 2: 后处理 (空洞填充) ---
-        with query_pass2:
+        if version >= 0.4:
             fbo_pass2.use() # 切换回默认的屏幕帧缓冲
             fbo_pass2.clear(0.0, 0.0, 0.0, 1.0) # 用不透明黑清空屏幕
             ctx.disable(moderngl.DEPTH_TEST) # 后处理不需要深度测试
-            ctx.disable(moderngl.BLEND)
             # 激活后处理着色器
             
             # 绑定 Pass 1 的输出纹理到纹理单元 0
@@ -615,64 +516,29 @@ def render_pipeline(
 
             # 渲染全屏四边形来触发填充逻辑
             postproc_vao.render(moderngl.TRIANGLE_STRIP)
-        # --- pass2 end ---
-        
-        # === 结果读取和计时 ===
-        # 在当前帧的最后，把上一帧的耗时结果存起来
-        # query.elapsed 返回的是纳秒 (nanoseconds)
-        pass1_times.append(query_pass1.elapsed / 1_000_000) # 转换为毫秒
-        pass2_times.append(query_pass2.elapsed / 1_000_000) # 转换为毫秒
-
         # --- 最终结果已经在屏幕上了 ---
         # 现在可以从屏幕帧缓冲读取数据来保存为图片或视频帧
-        # image_bytes = fbo_pass2.read(components=3)
-        # image_np_rgb = np.frombuffer(image_bytes, dtype=np.uint8).reshape((img_height, img_width, 3))
-        # image_np_bgr = cv2.cvtColor(np.flipud(image_np_rgb), cv2.COLOR_RGB2BGR) # **翻转并转为BGR**
-        # video_writer.write(image_np_bgr)  
-
-        # --- step 10.b: 尝试消费者线程：从 GPU 读取数据并放入队列 ---
-        # fbo_pass2.read() 仍然会同步，但它只等待 GPU 的 ~9.3ms，而不是等待上一帧的视频写入
-        # image_bytes = fbo_pass2.read(components=3)
-        fbo_pass2.read_into(cpu_buffers[current_buffer_idx])
-        # image_bytes_copy = bytes(image_bytes)  # 深拷贝
-        
-        # 将原始数据快速放入队列，让主线程解放出来
-        # 如果队列满了，put() 会阻塞，这形成了一个自然的“背压”机制
-        # frame_queue.put((image_bytes, img_height, img_width)) 
-        frame_queue.put((bytes(cpu_buffers[current_buffer_idx]), img_height, img_width))
-        
-        # 3. 切换到另一个缓冲区，为下一帧做准备
-        current_buffer_idx = 1 - current_buffer_idx
-                
-    # 发送结束信号到队列
-    frame_queue.put(None)
-    # 等待消费者线程处理完队列中的所有剩余帧
-    writer_thread.join()
-    
-    #video_writer.release()
+        if version >= 0.4:
+            image_bytes = fbo_pass2.read(components=3)
+            image_np_rgb = np.frombuffer(image_bytes, dtype=np.uint8).reshape((img_height, img_width, 3))
+            image_np_bgr = cv2.cvtColor(np.flipud(image_np_rgb), cv2.COLOR_RGB2BGR) # **翻转并转为BGR**
+            video_writer.write(image_np_bgr)            
+        else:
+            # 从FBO读取渲染好的图像
+            image = Image.frombytes('RGB', fbo.size, fbo.read(), 'raw', 'BGR', 0, -1)
+            # image.save(os.path.join(img_dir, f"frame_{idx:05d}.png"))
+            video_writer.write(np.array(image))
+    video_writer.release()
     log_info("save video to: " + video_path)
-    black_pixels = black_pixels / len(cam_poses)
     log_info("--- step 11: render done! ---")
-
-    # --- 循环结束后，计算并打印平均耗时 ---
-    # 忽略第一帧可能因JIT编译等产生的抖动
-    avg_pass1_ms = np.mean(pass1_times[1:]) 
-    avg_pass2_ms = np.mean(pass2_times[1:])
     
-    log_info(f"cnt == 0: {cnt_zero} ({cnt_zero/cnt_total*100:.2f}%)")
-    log_info(f"cnt >= {NUM_SAMPLES_PER_POINT}: {cnt_max} ({cnt_max/cnt_total*100:.2f}%)")
-    log_info(f"cnt in (0, {NUM_SAMPLES_PER_POINT}): {cnt_total - cnt_zero - cnt_max} ({(cnt_total - cnt_zero - cnt_max)/cnt_total*100:.2f}%)")
-    log_info(f"scene point num: {point_num}")
-    log_info(f"black pixels: {black_pixels * 100:.2f}%")
-    log_info(f"Average Pass 1 time: {avg_pass1_ms:.4f} ms")
-    log_info(f"Average Pass 2 time: {avg_pass2_ms:.4f} ms")    
 
 
 
 if __name__ == "__main__":
     dir = ROOT_DIR
     wh = [[100, 100], [616, 409], [1920, 1080]]
-    wh_idx = 1
+    wh_idx = 2
     render_pipeline(
         data_dir=dir,
         output_dir=dir,

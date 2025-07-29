@@ -1,6 +1,6 @@
 '''
-v0.4:
-    1. 这里开始只运行0.4以上版本
+v0.5:
+    1. 基于v0.5的RT渲染
 
 1. zip_point_cloud:
     读取3DGS点云，并压缩，存储在point_cloud_zip.ply
@@ -29,7 +29,9 @@ from pathlib import Path
 import glob
 import cv2
 import time
-
+import glfw
+from camera_controller import InteractiveCamera # 导入我们创建的类
+from collections import deque
 
 # 动态获取项目根目录（假设 point_render.py 在 glsl/ 子目录下）
 ROOT_DIR = Path(__file__).parent  # 向上两级到 GSSample/
@@ -45,8 +47,8 @@ NUM_POINTS_TO_KEEP = 1_000_000  # 3_000_000
 NUM_SAMPLES_PER_POINT = 256
 SCALE_CEIL = 5E-5
 OPACITY_CEIL = 0.5
-SCALE_CEIL = 5E-3
-OPACITY_CEIL = 1
+# SCALE_CEIL = 5E-3
+# OPACITY_CEIL = 1
 USE_HALF_PRECISION = False
 version = 0.5
 
@@ -275,7 +277,7 @@ def render_pipeline(
     point_size=2,
     logger=None
 ):
-    # --- 日志和文件夹设置 ---
+    # --- step 0: 日志和文件夹设置 ---
     def log_info(msg):
         if logger is None:
             print(msg)
@@ -296,11 +298,57 @@ def render_pipeline(
             os.remove(os.path.join(img_dir, file))
             del_cnt += 1
     log_info(f"del {del_cnt} pics")
+
+    # --- step 1: 初始化 GLFW 窗口 ---
+    log_info("--- Initializing GLFW Window ---")
+    if not glfw.init():
+        raise RuntimeError("Failed to initialize GLFW")
+    
+    # 创建一个可见窗口
+    glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 4)
+    glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
+    glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+    window = glfw.create_window(img_width, img_height, "Interactive 3DGS Renderer", None, None)
+    if not window:
+        glfw.terminate()
+        raise RuntimeError("Failed to create GLFW window")
+    glfw.make_context_current(window)
+
+    # --- step 2: 初始化 ModernGL (现在使用窗口上下文) ---
+    log_info("--- step 2: init ModernGL context ---")
+    ctx = moderngl.create_context()
+
+    # --- 设置键盘回调 ---
+    motion_state = {} # 存储按键状态的字典
+    def key_callback(window, key, scancode, action, mods):
+        if action == glfw.PRESS:
+            if key == glfw.KEY_W: motion_state['forward'] = True
+            if key == glfw.KEY_S: motion_state['backward'] = True
+            if key == glfw.KEY_A: motion_state['left'] = True
+            if key == glfw.KEY_D: motion_state['right'] = True
+            if key == glfw.KEY_SPACE: motion_state['down'] = True
+            if key == glfw.KEY_LEFT_CONTROL: motion_state['up'] = True
+            if key == glfw.KEY_Q: motion_state['rot_left'] = True
+            if key == glfw.KEY_E: motion_state['rot_right'] = True
+        elif action == glfw.RELEASE:
+            if key == glfw.KEY_W: motion_state['forward'] = False
+            if key == glfw.KEY_S: motion_state['backward'] = False
+            if key == glfw.KEY_A: motion_state['left'] = False
+            if key == glfw.KEY_D: motion_state['right'] = False
+            if key == glfw.KEY_SPACE: motion_state['down'] = False
+            if key == glfw.KEY_LEFT_CONTROL: motion_state['up'] = False
+            if key == glfw.KEY_Q: motion_state['rot_left'] = False
+            if key == glfw.KEY_E: motion_state['rot_right'] = False
+            
+    glfw.set_key_callback(window, key_callback)
+
+
+
     
     # --- step 2: 初始化 ModernGL ---
     log_info("--- step 2: init ModernGL context ---")
     # 初始化ModernGL离屏上下文
-    ctx = moderngl.create_standalone_context()
+    # ctx = moderngl.create_standalone_context()
     ctx.enable(moderngl.DEPTH_TEST) # 全局启用深度测试
     
     # --- step 3: 编译着色器程序 ---
@@ -363,24 +411,6 @@ def render_pipeline(
     cnt[cnt == 0] = 1
 
 
-    # # --- step 3.5: 编译视锥体裁剪的计算着色器 ---
-    # with open(os.path.join(path, 'glsl', f'cs_v{version:.1f}.glsl'), 'r', encoding="utf-8") as f:
-    #     cull_shader_code = f.read()
-    #     log_info(f"cull_shader_code: {cull_shader_code}")
-    # prog_cull = ctx.compute_shader(cull_shader_code)
-
-    
-    # # 准备用于裁剪的 SSBO (需要 vec4)
-    # points_world_vec4 = np.hstack([points_world, np.ones((point_num, 1))]).astype('f4')
-    # ssbo_all_positions = ctx.buffer(points_world_vec4.tobytes())
-    # ssbo_cnt = ctx.buffer(cnt.astype('i4').tobytes())
-    
-    # # 创建用于存储裁剪结果的 SSBO
-    # # 命令缓冲区现在的大小是 point_num (最坏情况)
-    # indirect_cmd_buffer = ctx.buffer(reserve=point_num * 5 * 4) 
-    # ssbo_atomic_counter = ctx.buffer(data=np.array([0], dtype='u4').tobytes()) # 初始化为0
-
-
 
     # --- step 5 & 6: 创建并上传 VBOs ---
     log_info("--- step 5: create and upload data to GPU buffer ---")
@@ -408,34 +438,6 @@ def render_pipeline(
     vao_content.append((vbo_random_seeds, '2f', 'in_rand_seed'))
 
     vao_main = ctx.vertex_array(prog, vao_content)
-
-
-
-
-    # --- step7，创建计算着色器和间接绘制缓冲区 ---
-    # 计算着色器，用于生成绘制命令
-    # with open(os.path.join(path, 'glsl', f'cs_v{version:.1f}.glsl'), 'r', encoding="utf-8") as f:
-    #     compute_shader_code = f.read()
-    # compute_prog = ctx.compute_shader(compute_shader_code)
-    # # 间接绘制命令缓冲区
-    # # 每个命令是 5 * 4 = 20 字节 (count, instanceCount, first, baseInstance, baseVertex)
-    # # 我们使用 MultiDrawArraysIndirect，所以需要 N 个命令
-    # indirect_cmd_buffer = ctx.buffer(reserve=point_num * 5 * 4)
-    # log_info("--- Running Pass 0 (Compute Shader) to generate indirect commands ONCE ---")
-    
-    
-    # # 绑定 SSBOs
-    # ssbo_cnt.bind_to_storage_buffer(0)
-    # indirect_cmd_buffer.bind_to_storage_buffer(1)
-    
-    # # 设置 uniforms 并运行计算着色器
-    # compute_prog['u_point_count'].value = point_num
-    # work_groups_x = (point_num + 1023) // 1024
-    # compute_prog.run(group_x=work_groups_x)
-    
-    # # **确保计算着色器执行完毕**
-    # ctx.finish() 
-    # log_info("--- Indirect command buffer generated. ---")
 
 
 
@@ -468,56 +470,36 @@ def render_pipeline(
 
     # --- step 9: 加载相机数据 ---
     log_info("--- step 9: load camera data ---")
+    camera = InteractiveCamera() # 创建我们的交互相机实例
     scene_dir = r"G:\Lab\NGSassist\data\bicycle"
     fov_x, fov_y, cam_poses = get_video_cam_info_from_bin(scene_dir, img_width, img_height)
     aspect_ratio = img_width / img_height
     znear, zfar = 0.01, 100.0
     projection_matrix = build_projection_matrix(fov_x, fov_y, aspect_ratio, znear, zfar)
-
-    # --- step 10: 准备视频写入器 ---
-    log_info("--- step 10: start render ---")
-    # video_path = os.path.join(output_dir, "render_video.mp4")
-    # fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
-    # # 注意：cv2的尺寸是 (宽, 高)
-    # video_writer = cv2.VideoWriter(video_path, fourcc, fps, (img_width, img_height)) # 30是帧率
-
-    # --- step 10.b: 尝试消费者线程 ---
-    from queue import Queue
-    from threading import Thread
-    # 创建一个线程安全的队列，设置一个最大尺寸以防止内存爆炸
-    video_path = os.path.join(output_dir, "render_video.mp4")
-    frame_queue = Queue(maxsize=360) 
-    
-    def video_writer_worker(queue, video_path, width, height, fps):
-        """一个在独立线程中运行的消费者函数"""
-        video_writer = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
-        while True:
-            # 从队列中获取数据，如果队列为空，会阻塞等待
-            item = queue.get()
-            # 收到结束信号 (None)
-            if item is None:
-                break
-            
-            image_bytes, img_h, img_w = item
-            
-            # --- 在这个线程中执行所有耗时的 CPU 操作 ---
-            image_np_rgb = np.frombuffer(image_bytes, dtype=np.uint8).reshape((img_h, img_w, 3))
-            image_np_bgr = cv2.cvtColor(np.flipud(image_np_rgb), cv2.COLOR_RGB2BGR)
-            video_writer.write(image_np_bgr)
-            
-            # 通知队列，一个任务已完成
-            queue.task_done()
-            
-        video_writer.release()
-        print("Video writer thread finished.")
-    # 启动消费者线程
-    writer_thread = Thread(target=video_writer_worker, 
-                           args=(frame_queue, video_path, img_width, img_height, fps))
-    writer_thread.start()
-
-    # 创建两个 CPU 端的字节缓冲区
-    cpu_buffers = [bytearray(img_width * img_height * 3) for _ in range(2)]
-    current_buffer_idx = 0
+     # --- 创建一个用于将最终纹理画到屏幕的简单 Program ---
+    blit_prog = ctx.program(
+        vertex_shader="""
+            #version 330
+            in vec2 in_vert;
+            out vec2 v_texCoord;
+            void main() {
+                v_texCoord = in_vert * 0.5 + 0.5;
+                gl_Position = vec4(in_vert, 0.0, 1.0);
+            }
+        """,
+        fragment_shader="""
+            #version 330
+            uniform sampler2D u_texture;
+            in vec2 v_texCoord;
+            out vec4 f_color;
+            void main() {
+                vec2 flipped_texCoord = vec2(v_texCoord.x, 1.0 - v_texCoord.y);
+                f_color = texture(u_texture, flipped_texCoord);
+            }
+        """
+    )
+    blit_vao = ctx.vertex_array(blit_prog, [(ctx.buffer(np.array([-1,-1, 1,-1, -1,1, 1,1], dtype='f4')), '2f', 'in_vert')])
+   
     ###############################################################################################
     start_time = time.time()
     # 设置时间uniform（如果存在）
@@ -543,40 +525,47 @@ def render_pipeline(
         view_matrixs.append(view_matrix)
     proj_matrix = projection_matrix
 
-
-    for idx, pose_c2w in enumerate(tqdm(cam_poses, desc="GPU render progress")):
-
-        # # --- pass0 视锥体裁剪 start ---
-        # # 1. 重置原子计数器
-        # ssbo_atomic_counter.write(np.array([0], dtype='u4'))
-        # # 3. 绑定 SSBOs
-        # ssbo_all_positions.bind_to_storage_buffer(0)
-        # ssbo_cnt.bind_to_storage_buffer(1)
-        # indirect_cmd_buffer.bind_to_storage_buffer(2)
-        # ssbo_atomic_counter.bind_to_storage_buffer(3)
-        # # 4. 设置 Uniforms
-        # prog_cull['u_proj_view'].write((proj_matrix @ view_matrixs[idx]).T.astype('f4').tobytes())
-        # prog_cull['u_total_points'].value = point_num
+    # FPS计算相关变量
+    frame_times = deque(maxlen=60)  # 存储最近60帧的时间
+    last_time = glfw.get_time()
+    frame_count = 0
+    last_fps_output_time = last_time  # 记录上次FPS输出的时间
+    while not glfw.window_should_close(window):
+        # --- 1. 事件和时间处理 ---
+        glfw.poll_events()
         
-        # # 5. 运行计算着色器
-        # work_groups_x = (point_num + 1023) // 1024
-        # prog_cull.run(group_x=work_groups_x)
-        # # 6. 插入内存屏障，确保后续的渲染可以安全地读取 SSBO
-        # ctx.memory_barrier(moderngl.SHADER_STORAGE_BARRIER_BIT)
-        # # (可选，用于调试) 读回可见点数量
-        # num_visible_commands = np.frombuffer(ssbo_atomic_counter.read(), dtype='u4')[0]
-        # if idx % 50 == 0:
-        #     log_info(f"Frame {idx}: Visible commands: {num_visible_commands}")
+        current_time = glfw.get_time()
+        delta_time = current_time - last_time
+        last_time = current_time
+        
+        # FPS计算
+        frame_times.append(delta_time)
+        frame_count += 1
+        if len(frame_times) > 1:
+            avg_frame_time = sum(frame_times) / len(frame_times)
+            current_fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0
+        else:
+            current_fps = 0
+            
+        # 每3秒输出一次FPS信息到控制台（固定一行）
+        if current_time - last_fps_output_time >= 3.0:
+            print(f"\rCurrent FPS: {current_fps:.1f}", end='', flush=True)
+            last_fps_output_time = current_time
+        
+        # --- 2. 更新相机 ---
+        camera.update(motion_state, delta_time)
+        view_matrix = camera.get_view_matrix() # 获取最新的视图矩阵
 
 
-
+        # --- 4. Pass 1 & 2: 渲染和后处理 (逻辑不变) ---
+        # ... (设置主渲染 prog 的 uniforms, view=view_matrix.T) ...
         # --- pass1 start ---
         with query_pass1:
             
             # 告诉主渲染着色器，可见索引在哪里
             # 设置 uniforms
             # 注意：GLSL中矩阵乘法是右乘，所以需要转置
-            prog['view'].write(view_matrixs[idx].T.astype('f4').tobytes())
+            prog['view'].write(view_matrix.T.astype('f4').tobytes())
             prog['projection'].write(proj_matrix.T.astype('f4').tobytes())
             fbo_pass1.use()  # 激活离屏FBO
             fbo_pass1.clear(0.0, 0.0, 0.0, 0.0)  # 透明黑清空
@@ -591,14 +580,6 @@ def render_pipeline(
             prog['MAX_INSTANCES'].value = NUM_SAMPLES_PER_POINT
             vao_main.render(moderngl.POINTS, vertices=point_num, instances=NUM_SAMPLES_PER_POINT)
             # vao_main.render_indirect(indirect_cmd_buffer, mode=moderngl.POINTS, count=num_visible_commands)
-        # **执行间接绘制**
-        # vao_main.render_indirect(indirect_cmd_buffer, mode=moderngl.POINTS)        
-        # --- pass1 end ---
-
-        # 统计纯黑像素数
-        # image_bytes = fbo_pass1.read(components=4, alignment=1)
-        # image_np_rgba = np.frombuffer(image_bytes, dtype=np.uint8).reshape((img_height, img_width, 4))
-        # black_pixels += np.sum(image_np_rgba[:, :, 3] == 0) / total_pixels
 
 
         # --- Pass 2: 后处理 (空洞填充) ---
@@ -622,35 +603,21 @@ def render_pipeline(
         # query.elapsed 返回的是纳秒 (nanoseconds)
         pass1_times.append(query_pass1.elapsed / 1_000_000) # 转换为毫秒
         pass2_times.append(query_pass2.elapsed / 1_000_000) # 转换为毫秒
-
-        # --- 最终结果已经在屏幕上了 ---
-        # 现在可以从屏幕帧缓冲读取数据来保存为图片或视频帧
-        # image_bytes = fbo_pass2.read(components=3)
-        # image_np_rgb = np.frombuffer(image_bytes, dtype=np.uint8).reshape((img_height, img_width, 3))
-        # image_np_bgr = cv2.cvtColor(np.flipud(image_np_rgb), cv2.COLOR_RGB2BGR) # **翻转并转为BGR**
-        # video_writer.write(image_np_bgr)  
-
-        # --- step 10.b: 尝试消费者线程：从 GPU 读取数据并放入队列 ---
-        # fbo_pass2.read() 仍然会同步，但它只等待 GPU 的 ~9.3ms，而不是等待上一帧的视频写入
-        # image_bytes = fbo_pass2.read(components=3)
-        fbo_pass2.read_into(cpu_buffers[current_buffer_idx])
-        # image_bytes_copy = bytes(image_bytes)  # 深拷贝
         
-        # 将原始数据快速放入队列，让主线程解放出来
-        # 如果队列满了，put() 会阻塞，这形成了一个自然的“背压”机制
-        # frame_queue.put((image_bytes, img_height, img_width)) 
-        frame_queue.put((bytes(cpu_buffers[current_buffer_idx]), img_height, img_width))
+        # --- 5. 将最终结果画到屏幕上 ---
+        ctx.screen.use() # 激活窗口的默认帧缓冲
+        ctx.clear(0.0, 0.0, 0.0, 1.0)
+        ctx.disable(moderngl.DEPTH_TEST)
+        texture_pass1.use(location=0) # 假设 fbo_pass2 的输出是 texture_pass2
+        blit_prog['u_texture'].value = 0
+        blit_vao.render(moderngl.TRIANGLE_STRIP)
         
-        # 3. 切换到另一个缓冲区，为下一帧做准备
-        current_buffer_idx = 1 - current_buffer_idx
-                
-    # 发送结束信号到队列
-    frame_queue.put(None)
-    # 等待消费者线程处理完队列中的所有剩余帧
-    writer_thread.join()
+        # --- 6. 交换缓冲区 ---
+        glfw.swap_buffers(window)
+        
+    # --- 清理 ---
+    glfw.terminate()
     
-    #video_writer.release()
-    log_info("save video to: " + video_path)
     black_pixels = black_pixels / len(cam_poses)
     log_info("--- step 11: render done! ---")
 

@@ -22,6 +22,16 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from scene.cameras import Camera, MiniCam
+from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+import json
+import numpy as np
+import cv2
+from read_write_model import read_images_binary, read_cameras_binary, qvec2rotmat
+from scene.dataset_readers import CameraInfo
+from PIL import Image
+from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -33,6 +43,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
+
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -85,6 +96,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        if iteration % 300 == 0:
+            image_cpu = torch.clamp(image.detach(), 0.0, 1.0).cpu().numpy()
+            image_cv = (image_cpu * 255).astype(np.uint8)
+            image_cv = np.transpose(image_cv, (1, 2, 0))  # CHW -> HWC
+            image_cv = cv2.cvtColor(image_cv, cv2.COLOR_RGB2BGR)  # RGB -> BGR
+            # 不阻塞运行
+            cv2.imshow("image", image_cv)
+            cv2.waitKey(1)
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -112,17 +131,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene.save(iteration)
 
             # Densification
-            # if iteration < opt.densify_until_iter:
-            #     # Keep track of max radii in image-space for pruning
-            #     gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-            #     gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
-            #
-            #     if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-            #         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-            #         gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
-            #
-            #     if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-            #         gaussians.reset_opacity()
+            if iteration < opt.densify_until_iter:
+                # Keep track of max radii in image-space for pruning
+                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+            
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+            
+                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                    gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -132,6 +151,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+    # vid_cam_infos = get_video_cameras()
+    # for cam in vid_cam_infos:
+    #     image = render(cam, gaussians, pipe, background)["render"]
+    #     image_cpu = torch.clamp(image.detach(), 0.0, 1.0).cpu().numpy()
+    #     image_cv = (image_cpu * 255).astype(np.uint8)
+    #     image_cv = np.transpose(image_cv, (1, 2, 0))  # CHW -> HWC
+    #     image_cv = cv2.cvtColor(image_cv, cv2.COLOR_RGB2BGR)  # RGB -> BGR
+    #     cv2.imshow("images", image_cv)
+    #     cv2.waitKey(1)
+
+
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -205,7 +236,7 @@ if __name__ == "__main__":
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[7_000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
