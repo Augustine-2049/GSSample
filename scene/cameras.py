@@ -59,6 +59,22 @@ class Camera(nn.Module):
         self.image_width = width
         self.image_height = height
 
+    def update_cam_pos(self, T, R):
+        self.T = T
+        self.R = R
+        # .cpu() - 因为NumPy不能直接处理GPU内存，所以先要移到CPU
+        # .numpy() - 将CPU上的Tensor转换为NumPy数组
+        R_np = R.cpu().numpy()
+        T_np = T.cpu().numpy()
+
+        # 现在使用转换后的NumPy数组调用辅助函数
+        self.world_view_transform = torch.tensor(getWorld2View2(R_np, T_np, self.trans, self.scale)).transpose(0, 1).cuda()
+        
+        # 后续的计算保持不变
+        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
+        self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
+        self.camera_center = self.world_view_transform.inverse()[3, :3]
+
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):
         self.image_width = width

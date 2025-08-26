@@ -1,7 +1,7 @@
 
 import math
 import gc # 引入垃圾回收模块
-from video_cam import get_vid_cam_from_bin
+from cam_pos.read_cam_pos import get_vid_cam_from_bin, get_vid_cam_from_json
 from gaussian_renderer import render
 from scene import Scene, GaussianModel
 from pathlib import Path
@@ -12,7 +12,7 @@ import numpy as np
 import cv2
 from tqdm import tqdm
 from PIL import Image
-from point_render_pipeline import zip_point_cloud, build_projection_matrix, get_video_cam_info
+from point_render_pipeline import zip_point_cloud, build_projection_matrix, get_video_cam_info_from_bin
 from utils.general_utils import safe_state
 
 from argparse import ArgumentParser, Namespace
@@ -27,10 +27,16 @@ ROOT_DIR = Path(__file__).parent  # 向上两级到 GSSample/
 sys.path.append(str(ROOT_DIR))  # 将根目录加入 Python 路径
 mode = "GPU"
 FPS = 10
-NUM_POINTS_TO_KEEP = 20_000_000
+NUM_POINTS_TO_KEEP = 3_000_000
 NUM_SAMPLES_PER_POINT = 1024
-USE_HALF_PRECISION = False
-version = 0.4
+dir = ROOT_DIR
+wh = [[100, 100], [616, 409], [1920, 1080], [800, 800]]
+wh_idx = 3
+ALL = True
+scene_name = "drums"
+scenes_name = ["drums", "ficus", "hotdog", "lego", "materials", "mic", "ship", "chair"]  # 在这里设置需要渲染的场景
+data_dir = r"H:\800_DataSet\NeRF_Synthesis\3DGS_nerf_synthesis" + "\\" + scene_name
+start_checkpoint = r"H:\800_DataSet\NeRF_Synthesis\3DGS_res_7000" + "\\" + scene_name + "\\" + "chkpnt7000.pth"
 
 # 导入log系统，设置日志输出位置
 import logging
@@ -55,6 +61,271 @@ if not logger.handlers:
 
 
 
+def render_by_3DGS_video(
+    dataset, opt, pipe, checkpoint,
+    data_dir=".", 
+    output_dir=".", 
+    num_points_to_keep=1_000_000, 
+    opacity_threshold=0.01,
+    img_width=100, 
+    img_height=100,
+    fps=10,
+    delete_images=True,
+    point_size=2,
+    logger=None,
+    vid_name=None
+):
+    with torch.no_grad():
+        first_iter = 0
+        gaussians = GaussianModel(dataset.sh_degree)
+        # scene = Scene(dataset, gaussians)
+        background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
+
+        gaussians.training_setup(opt)
+        (model_params, first_iter) = torch.load(checkpoint)
+        gaussians.restore(model_params, opt)
+        vid_cam_infos = get_vid_cam_from_json(path = data_dir,tar_width=img_width, tar_height=img_height)
+        # video_path = os.path.join(output_dir, "render_video_gs.mp4")
+        # fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
+        # # 注意：cv2的尺寸是 (宽, 高)
+        # video_writer = cv2.VideoWriter(video_path, fourcc, fps, (img_width, img_height)) # 30是帧率
+        # --- step 9.b: 尝试消费者线程 ---
+        from queue import Queue
+        from threading import Thread
+        # 创建一个线程安全的队列，设置一个最大尺寸以防止内存爆炸
+        if not vid_name:
+            vid_name = "render_video.mp4"
+        else:
+            vid_name = vid_name + ".mp4"
+        video_path = os.path.join(output_dir, vid_name)
+        frame_queue = Queue(maxsize=360) 
+        
+        def video_writer_worker(queue, video_path, width, height, fps):
+            """一个在独立线程中运行的消费者函数"""
+            video_writer = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+            while True:
+                # 从队列中获取数据，如果队列为空，会阻塞等待
+                item = queue.get()
+                # 收到结束信号 (None)
+                if item is None:
+                    break
+                
+                image_bytes, img_h, img_w = item
+                
+                # --- 在这个线程中执行所有耗时的 CPU 操作 ---
+                image_np_rgb = np.frombuffer(image_bytes, dtype=np.uint8).reshape((img_h, img_w, 3))
+                image_np_bgr = cv2.cvtColor(np.flipud(image_np_rgb), cv2.COLOR_RGB2BGR)
+                video_writer.write(image_np_bgr)
+                
+                # 通知队列，一个任务已完成
+                queue.task_done()
+                
+            video_writer.release()
+            print("Video writer thread finished.")
+        # 启动消费者线程
+        writer_thread = Thread(target=video_writer_worker, 
+                            args=(frame_queue, video_path, img_width, img_height, fps))
+        writer_thread.start()
+
+        # 创建两个 CPU 端的字节缓冲区
+        cpu_buffers = [bytearray(img_width * img_height * 3) for _ in range(2)]
+        current_buffer_idx = 0
+        ###############################################################################################
+
+
+
+
+        for idx, cam in enumerate(tqdm(vid_cam_infos, desc="GPU render progress")):
+            cam.update_wh(img_width, img_height)
+            image = render(cam, gaussians, pipe, background)["render"].detach()
+            image_cpu = torch.clamp(image, 0.0, 1.0).cpu().numpy()
+            image_cv = (image_cpu * 255).astype(np.uint8)
+            image_cv = np.transpose(image_cv, (1, 2, 0))  # CHW -> HWC
+            image_cv = cv2.flip(image_cv, 0)
+            # video_writer.write(np.array(image_cv))
+            # cv2.imwrite(f"render_img/{idx}.png", image_cv)
+            # if idx % 5 == 0:
+            torch.cuda.empty_cache()
+            
+            image_bytes = image_cv.tobytes()
+            frame_queue.put((image_bytes, img_height, img_width))
+            
+            
+            # 3. 切换到另一个缓冲区，为下一帧做准备
+            current_buffer_idx = 1 - current_buffer_idx
+        # video_writer.release()
+        
+        frame_queue.put(None)
+        writer_thread.join()
+        #log_info("save video to: " + video_path)
+
+
+def render_by_3DGS_img(
+    dataset, opt, pipe, checkpoint,
+    data_dir=".", 
+    output_dir=".", 
+    num_points_to_keep=1_000_000, 
+    opacity_threshold=0.01,
+    img_width=100, 
+    img_height=100,
+    fps=10,
+    delete_images=True,
+    point_size=2,
+    logger=None,
+    vid_name=None
+):
+    global scene_name
+    with torch.no_grad():
+        first_iter = 0
+        gaussians = GaussianModel(dataset.sh_degree)
+        # scene = Scene(dataset, gaussians)
+        background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
+
+        gaussians.training_setup(opt)
+        (model_params, first_iter) = torch.load(checkpoint)
+        gaussians.restore(model_params, opt)
+        vid_cam_infos = get_vid_cam_from_json(path = data_dir,
+                                                tar_width=img_width, 
+                                                tar_height=img_height,
+                                                transformsfile = "transforms_test.json")
+
+
+
+        for idx, cam in enumerate(tqdm(vid_cam_infos, desc="GPU render progress")):
+            cam.update_wh(img_width, img_height)
+            image = render(cam, gaussians, pipe, background)["render"].detach()
+            image_cpu = torch.clamp(image, 0.0, 1.0).cpu().numpy()
+            image_cv = (image_cpu * 255).astype(np.uint8)
+            image_cv = np.transpose(image_cv, (1, 2, 0))  # CHW -> HWC
+            image_cv = cv2.flip(image_cv, 0)
+            
+            image_bytes = image_cv.tobytes()
+            image_np_rgb = np.frombuffer(image_bytes, dtype=np.uint8).reshape((img_height, img_width, 3))
+            image_np_bgr = cv2.cvtColor(np.flipud(image_np_rgb), cv2.COLOR_RGB2BGR)
+            output_dir = f"{scene_name}_test"
+
+            # 2. 使用 os.makedirs 确保该文件夹存在
+            os.makedirs(output_dir, exist_ok=True)
+            cv2.imwrite(f"{output_dir}/{idx}.png", image_np_bgr)
+            torch.cuda.empty_cache()
+            
+
+
+if __name__ == "__main__":
+    if not ALL:
+        
+        # Set up command line argument parser
+        parser = ArgumentParser(description="Training script parameters")
+        lp = ModelParams(parser)
+        op = OptimizationParams(parser)
+        pp = PipelineParams(parser)
+        parser.add_argument('--ip', type=str, default="127.0.0.1")
+        parser.add_argument('--port', type=int, default=6009)
+        parser.add_argument('--debug_from', type=int, default=-1)
+        parser.add_argument('--detect_anomaly', action='store_true', default=False)
+        parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+        parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+        parser.add_argument("--quiet", action="store_true")
+        parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+        parser.add_argument("--start_checkpoint", type=str, default = start_checkpoint)# r"G:\Lab\GSSample\output\92825354-f\chkpnt7000.pth")
+        args = parser.parse_args(sys.argv[1:])
+        args.save_iterations.append(args.iterations)
+        
+        print("Optimizing " + args.model_path)
+
+        torch.autograd.set_detect_anomaly(args.detect_anomaly)
+        # Initialize system state (RNG)
+        safe_state(args.quiet)
+        render_by_3DGS_img(
+            lp.extract(args), op.extract(args), pp.extract(args), args.start_checkpoint,
+            data_dir=data_dir,
+            output_dir=dir,
+            num_points_to_keep=NUM_POINTS_TO_KEEP, # 10_000_000
+            opacity_threshold=None,
+            img_width=wh[wh_idx][0],
+            img_height=wh[wh_idx][1],
+            fps=FPS,
+            delete_images=True,
+            point_size=1,
+            logger=logger,
+            vid_name=scene_name
+        )
+    else:
+        for _ in scenes_name:
+            scene_name = _
+
+            start_checkpoint = r"H:\800_DataSet\NeRF_Synthesis\3DGS_res_7000" + "\\" + scene_name + "\\" + "chkpnt7000.pth"
+            data_dir = r"H:\800_DataSet\NeRF_Synthesis\3DGS_nerf_synthesis" + "\\" + scene_name
+            
+            # Set up command line argument parser
+            parser = ArgumentParser(description="Training script parameters")
+            lp = ModelParams(parser)
+            op = OptimizationParams(parser)
+            pp = PipelineParams(parser)
+            parser.add_argument('--ip', type=str, default="127.0.0.1")
+            parser.add_argument('--port', type=int, default=6009)
+            parser.add_argument('--debug_from', type=int, default=-1)
+            parser.add_argument('--detect_anomaly', action='store_true', default=False)
+            parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+            parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+            parser.add_argument("--quiet", action="store_true")
+            parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+            parser.add_argument("--start_checkpoint", type=str, default = start_checkpoint)# r"G:\Lab\GSSample\output\92825354-f\chkpnt7000.pth")
+            args = parser.parse_args(sys.argv[1:])
+            args.save_iterations.append(args.iterations)
+            
+            print("Optimizing " + args.model_path)
+
+            torch.autograd.set_detect_anomaly(args.detect_anomaly)
+            # Initialize system state (RNG)
+            safe_state(args.quiet)
+            render_by_3DGS_img(
+            lp.extract(args), op.extract(args), pp.extract(args), args.start_checkpoint,
+            data_dir=data_dir,
+            output_dir=dir,
+            num_points_to_keep=NUM_POINTS_TO_KEEP, # 10_000_000
+            opacity_threshold=None,
+            img_width=wh[wh_idx][0],
+            img_height=wh[wh_idx][1],
+            fps=FPS,
+            delete_images=True,
+            point_size=1,
+            logger=logger,
+            vid_name=scene_name
+            )
+            # render_by_3DGS_video(
+            #     lp.extract(args), op.extract(args), pp.extract(args), args.start_checkpoint,
+            #     data_dir=data_dir,
+            #     output_dir=dir,
+            #     num_points_to_keep=NUM_POINTS_TO_KEEP, # 10_000_000
+            #     opacity_threshold=None,
+            #     img_width=wh[wh_idx][0],
+            #     img_height=wh[wh_idx][1],
+            #     fps=FPS,
+            #     delete_images=True,
+            #     point_size=1,
+            #     logger=logger,
+            #     vid_name=scene_name
+            # )
+
+########################################################################################
+#######  下面不看 #######################################################################
+########################################################################################
+
+
+# render_by_3DGS(
+#     data_dir=dir,
+#     output_dir=dir,
+#     num_points_to_keep=NUM_POINTS_TO_KEEP, # 10_000_000
+#     opacity_threshold=None,
+#     img_width=wh[wh_idx][0],
+#     img_height=wh[wh_idx][1],
+#     fps=FPS,
+#     delete_images=True,
+#     point_size=1,
+#     logger=logger
+# )
+
 def render_by_3DGS(
     data_dir=".", 
     output_dir=".", 
@@ -67,6 +338,11 @@ def render_by_3DGS(
     point_size=2,
     logger=None
 ):
+    '''
+    这段是曾经对底层_C调用的尝试，目前看来不需要，废弃
+    - 只是后续可能分析调用内容有用所以暂时保留
+
+    '''
     # --- 日志和文件夹设置 ---
     def log_info(msg):
         if logger is None:
@@ -144,14 +420,13 @@ def render_by_3DGS(
 
         # --- step 8: 加载相机数据 ---
         log_info("--- step 8: load camera data ---")
-        fov_rad, cam_poses = get_video_cam_info(data_dir)
+        fov_x, fov_y, cam_poses = get_video_cam_info_from_bin(data_dir, img_width, img_height)
         aspect_ratio = img_width / img_height
-        tanfovx = np.tan(fov_rad * 0.5)
+        tanfovx = np.tan(fov_x * 0.5)
         tanfovy = tanfovx / aspect_ratio
     
         znear, zfar = 0.01, 100.0
-        f = 1.0 / np.tan(fov_rad / 2.0)
-        projection_matrix = torch.from_numpy(build_projection_matrix(fov_rad, aspect_ratio, znear, zfar)).to(device, dtype=torch.float32)
+        projection_matrix = torch.from_numpy(build_projection_matrix(fov_x, fov_y, aspect_ratio, znear, zfar)).to(device, dtype=torch.float32)
 
         background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
         # --- step 9: 准备视频写入器 ---
@@ -225,99 +500,3 @@ def render_by_3DGS(
             video_writer.write(np.array(image_bgr))
             torch.cuda.empty_cache()  # 重点，没这个卡死
         video_writer.release()
-
-def render_by_3DGS_video(
-    dataset, opt, pipe, checkpoint,
-    data_dir=".", 
-    output_dir=".", 
-    num_points_to_keep=1_000_000, 
-    opacity_threshold=0.01,
-    img_width=100, 
-    img_height=100,
-    fps=10,
-    delete_images=True,
-    point_size=2,
-    logger=None
-):
-    with torch.no_grad():
-        first_iter = 0
-        gaussians = GaussianModel(dataset.sh_degree)
-        # scene = Scene(dataset, gaussians)
-        background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
-
-        gaussians.training_setup(opt)
-        (model_params, first_iter) = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
-        vid_cam_infos = get_vid_cam_from_bin(tar_width=img_width, tar_height=img_height)
-        video_path = os.path.join(output_dir, "render_video_gs.mp4")
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
-        # 注意：cv2的尺寸是 (宽, 高)
-        video_writer = cv2.VideoWriter(video_path, fourcc, fps, (img_width, img_height)) # 30是帧率
-        for idx, cam in enumerate(tqdm(vid_cam_infos, desc="GPU render progress")):
-            cam.update_wh(img_width, img_height)
-            image = render(cam, gaussians, pipe, background)["render"].detach()
-            image_cpu = torch.clamp(image, 0.0, 1.0).cpu().numpy()
-            image_cv = (image_cpu * 255).astype(np.uint8)
-            image_cv = np.transpose(image_cv, (1, 2, 0))  # CHW -> HWC
-            image_cv = cv2.cvtColor(image_cv, cv2.COLOR_RGB2BGR)  # RGB -> BGR
-            video_writer.write(np.array(image_cv))
-            # cv2.imwrite(f"render_img/{idx}.png", image_cv)
-            # if idx % 5 == 0:
-            torch.cuda.empty_cache()
-        video_writer.release()
-
-if __name__ == "__main__":
-    dir = ROOT_DIR
-    wh = [[100, 100], [616, 409], [1920, 1080]]
-    wh_idx = 2
-
-    # Set up command line argument parser
-    parser = ArgumentParser(description="Training script parameters")
-    lp = ModelParams(parser)
-    op = OptimizationParams(parser)
-    pp = PipelineParams(parser)
-    parser.add_argument('--ip', type=str, default="127.0.0.1")
-    parser.add_argument('--port', type=int, default=6009)
-    parser.add_argument('--debug_from', type=int, default=-1)
-    parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--start_checkpoint", type=str, default = r"G:\Lab\GSSample\output\92825354-f\chkpnt7000.pth")
-    args = parser.parse_args(sys.argv[1:])
-    args.save_iterations.append(args.iterations)
-    
-    print("Optimizing " + args.model_path)
-
-    torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    # Initialize system state (RNG)
-    safe_state(args.quiet)
-
-    # render_by_3DGS(
-    #     data_dir=dir,
-    #     output_dir=dir,
-    #     num_points_to_keep=NUM_POINTS_TO_KEEP, # 10_000_000
-    #     opacity_threshold=None,
-    #     img_width=wh[wh_idx][0],
-    #     img_height=wh[wh_idx][1],
-    #     fps=FPS,
-    #     delete_images=True,
-    #     point_size=1,
-    #     logger=logger
-    # )
-    render_by_3DGS_video(
-        lp.extract(args), op.extract(args), pp.extract(args), args.start_checkpoint,
-        data_dir=dir,
-        output_dir=dir,
-        num_points_to_keep=NUM_POINTS_TO_KEEP, # 10_000_000
-        opacity_threshold=None,
-        img_width=wh[wh_idx][0],
-        img_height=wh[wh_idx][1],
-        fps=FPS,
-        delete_images=True,
-        point_size=1,
-        logger=logger
-    )
-
-

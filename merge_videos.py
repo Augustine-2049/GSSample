@@ -265,7 +265,7 @@ def main():
     """主函数"""
     
     # 视频路径
-    baseline_path = "baseline.mp4"  # 左侧视频
+    baseline_path = "render_video_gs.mp4"  # 左侧视频 baseline
     render_path = "render_video.mp4"  # 右侧视频
     output_path = "comparison_video.mp4"  # 输出视频
     

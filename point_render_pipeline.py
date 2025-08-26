@@ -30,6 +30,8 @@ import glob
 import cv2
 import time
 
+from cam_pos.read_cam_pos import get_video_cam_info_from_json, get_video_cam_info_from_bin
+
 
 # 动态获取项目根目录（假设 point_render.py 在 glsl/ 子目录下）
 ROOT_DIR = Path(__file__).parent  # 向上两级到 GSSample/
@@ -42,13 +44,17 @@ FPS = 10
 # 2000 10 = 75%black 29fps
 # 2000 10 = 50%black 29fps, no filter
 NUM_POINTS_TO_KEEP = 1_000_000  # 3_000_000
-NUM_SAMPLES_PER_POINT = 256
+NUM_SAMPLES_PER_POINT = 512
 SCALE_CEIL = 5E-5
 OPACITY_CEIL = 0.5
-SCALE_CEIL = 5E-3
-OPACITY_CEIL = 1
+# SCALE_CEIL = 5E-3
+# OPACITY_CEIL = 1
 USE_HALF_PRECISION = False
 version = 0.5
+wh_idx = 3
+scene_name = "drums" # op : ["drums", "ficus", "hotdog", "lego", "materials", "mic", "ship", "chair"] 
+point_cloud_dir = r"H:\800_DataSet\NeRF_Synthesis\3DGS_res_7000" + "\\" + scene_name + "\\" + "point_cloud" + "\\" + "iteration_7000"
+
 
 # 导入log系统，设置日志输出位置
 import logging
@@ -150,101 +156,6 @@ def zip_point_cloud(src_path = ".", num_to_keep: int = 100000, opacity_threshold
     new_plydata.write(tar_path)
     print(f"点云已保存到 {tar_path}")
     return new_plydata
-
-
-def get_video_cam_info_from_json(json_path = os.getcwd()):
-    '''
-    返回一个列表，每个元素是一个numpy数组
-    '''
-    cam_path = os.path.join(json_path, "transforms_video.json")
-    if not os.path.exists(cam_path):
-        print(f"相机位姿文件不存在: {cam_path}")
-        return None, []
-    with open(cam_path, 'r') as f:
-        cam_data = json.load(f)
-    fov = cam_data['camera_angle_x']
-    frames = []
-    for frame in cam_data['frames']:
-        # 将列表转换为numpy数组
-        transform_matrix = np.array(frame['transform_matrix'], dtype=np.float32)
-        frames.append(transform_matrix)
-    return fov, frames
-
-def get_video_cam_info_from_bin(
-    scene_path, tar_width = 1920, tar_height = 1080,
-    ):
-    '''
-    从COLMAP二进制文件读取相机信息
-    返回fov和相机位姿列表
-    fov记录在cameras.bin中
-    frames记录在video.bin中
-    '''
-
-    import struct
-    vid_path = os.path.join(scene_path, "sparse", "0", "video.bin")
-    if not os.path.exists(vid_path):
-        print(f"相机位姿文件不存在: {vid_path}")
-        return None, []
-    
-    # 读取cameras.bin获取相机内参
-    cameras_path = os.path.join(scene_path, "sparse", "0", "cameras.bin")
-    if not os.path.exists(cameras_path):
-        print(f"相机内参文件不存在: {cameras_path}")
-        return None, []
-    from read_write_model import read_cameras_binary, read_images_binary
-    cameras = read_cameras_binary(cameras_path)  # 相机内参
-    images = read_images_binary(vid_path)  # 相机外参
-    
-    # 计算FOV
-    # 获取第一个相机的内参
-    first_camera = list(cameras.values())[0]
-    width, height = first_camera.width, first_camera.height
-    
-    # PINHOLE
-    fx, fy, cx, cy = first_camera.params
-    focal_length_x = fx * tar_width / width
-    focal_length_y = fy * tar_width / width
-    from utils.graphics_utils import focal2fov
-    FovY = focal2fov(focal_length_x, tar_height)
-    FovX = focal2fov(focal_length_x, tar_width)
-
-    # fov = 2 * np.arctan(width / (2 * fx))  # 水平FOV
-    
-    # 构建相机位姿列表
-    frames = []
-    # 相机外参实际就是七个数字
-    for image_id, image in images.items():
-        # 获取四元数和平移向量
-        qvec = image.qvec  # (w, x, y, z) 从世界坐标系变换到相机坐标系的刚体变换
-        tvec = image.tvec  # (x, y, z) 从世界坐标系变换到相机坐标系的刚体变换
-        
-        # 转换为旋转矩阵
-        from scipy.spatial.transform import Rotation as R
-        rot_w2c = R.from_quat([qvec[1], qvec[2], qvec[3], qvec[0]])
-        R_wc = rot_w2c.as_matrix()
-        R_cw = R_wc.T
-        t_cw = -R_cw @ tvec
-        
-        c2w_cv = np.identity(4)
-        c2w_cv[:3, :3] = R_cw
-        c2w_cv[:3, 3] = t_cw
-        
-        
-        # --- 步骤 2: 定义从 OpenCV 到 OpenGL 相机坐标系的转换矩阵 ---
-        # 这个转换在相机的局部空间中进行，翻转 Y 和 Z 轴
-        opencv_to_opengl_transform = np.array([
-            [1, 0, 0, 0],
-            [0, -1, 0, 0],
-            [0, 0, -1, 0],
-            [0, 0, 0, 1]
-        ])
-        
-        # --- 步骤 3: 将 C2W_cv 转换为 C2W_gl ---
-        # 公式: C2W_gl = C2W_cv @ OpencvToOpengl
-        transform_matrix = c2w_cv @ opencv_to_opengl_transform
-        frames.append(transform_matrix)
-
-    return FovX, FovY, frames
 
 
 
@@ -468,8 +379,8 @@ def render_pipeline(
 
     # --- step 9: 加载相机数据 ---
     log_info("--- step 9: load camera data ---")
-    scene_dir = r"G:\Lab\NGSassist\data\bicycle"
-    fov_x, fov_y, cam_poses = get_video_cam_info_from_bin(scene_dir, img_width, img_height)
+    scene_dir = r"G:\Lab\GSSample"# r"G:\Lab\NGSassist\data\bicycle"
+    fov_x, fov_y, cam_poses = get_video_cam_info_from_json(scene_dir, img_width, img_height)
     aspect_ratio = img_width / img_height
     znear, zfar = 0.01, 100.0
     projection_matrix = build_projection_matrix(fov_x, fov_y, aspect_ratio, znear, zfar)
@@ -633,7 +544,7 @@ def render_pipeline(
         # --- step 10.b: 尝试消费者线程：从 GPU 读取数据并放入队列 ---
         # fbo_pass2.read() 仍然会同步，但它只等待 GPU 的 ~9.3ms，而不是等待上一帧的视频写入
         # image_bytes = fbo_pass2.read(components=3)
-        fbo_pass2.read_into(cpu_buffers[current_buffer_idx])
+        fbo_pass1.read_into(cpu_buffers[current_buffer_idx])
         # image_bytes_copy = bytes(image_bytes)  # 深拷贝
         
         # 将原始数据快速放入队列，让主线程解放出来
@@ -671,10 +582,9 @@ def render_pipeline(
 
 if __name__ == "__main__":
     dir = ROOT_DIR
-    wh = [[100, 100], [616, 409], [1920, 1080]]
-    wh_idx = 1
+    wh = [[100, 100], [616, 409], [1920, 1080], [800, 800]]
     render_pipeline(
-        data_dir=dir,
+        data_dir=point_cloud_dir,
         output_dir=dir,
         num_points_to_keep=NUM_POINTS_TO_KEEP, # 10_000_000
         opacity_threshold=None,

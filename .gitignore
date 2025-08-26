@@ -79,6 +79,7 @@ logs/
 transforms_video.json
 test*
 *.mp4
+*.xmind
 # *.obj
 # *.pkl
 # *.npz

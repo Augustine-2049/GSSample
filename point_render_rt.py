@@ -32,6 +32,7 @@ import time
 import glfw
 from camera_controller import InteractiveCamera # 导入我们创建的类
 from collections import deque
+from cam_pos.read_cam_pos import get_video_cam_info_from_json, get_video_cam_info_from_bin
 
 # 动态获取项目根目录（假设 point_render.py 在 glsl/ 子目录下）
 ROOT_DIR = Path(__file__).parent  # 向上两级到 GSSample/
@@ -43,14 +44,17 @@ FPS = 10
 # 2000 100 = 37%black, 14fps
 # 2000 10 = 75%black 29fps
 # 2000 10 = 50%black 29fps, no filter
-NUM_POINTS_TO_KEEP = 1_000_000  # 3_000_000
-NUM_SAMPLES_PER_POINT = 256
+NUM_POINTS_TO_KEEP = 1_000_000  # 1_000_000
+NUM_SAMPLES_PER_POINT = 256# 256
 SCALE_CEIL = 5E-5
 OPACITY_CEIL = 0.5
 # SCALE_CEIL = 5E-3
 # OPACITY_CEIL = 1
 USE_HALF_PRECISION = False
 version = 0.5
+wh_idx = 3
+scene_name = "drums" # op : ["drums", "ficus", "hotdog", "lego", "materials", "mic", "ship", "chair"] 
+point_cloud_dir = r"H:\800_DataSet\NeRF_Synthesis\3DGS_res_7000" + "\\" + scene_name + "\\" + "point_cloud" + "\\" + "iteration_7000"
 
 # 导入log系统，设置日志输出位置
 import logging
@@ -153,100 +157,6 @@ def zip_point_cloud(src_path = ".", num_to_keep: int = 100000, opacity_threshold
     print(f"点云已保存到 {tar_path}")
     return new_plydata
 
-
-def get_video_cam_info_from_json(json_path = os.getcwd()):
-    '''
-    返回一个列表，每个元素是一个numpy数组
-    '''
-    cam_path = os.path.join(json_path, "transforms_video.json")
-    if not os.path.exists(cam_path):
-        print(f"相机位姿文件不存在: {cam_path}")
-        return None, []
-    with open(cam_path, 'r') as f:
-        cam_data = json.load(f)
-    fov = cam_data['camera_angle_x']
-    frames = []
-    for frame in cam_data['frames']:
-        # 将列表转换为numpy数组
-        transform_matrix = np.array(frame['transform_matrix'], dtype=np.float32)
-        frames.append(transform_matrix)
-    return fov, frames
-
-def get_video_cam_info_from_bin(
-    scene_path, tar_width = 1920, tar_height = 1080,
-    ):
-    '''
-    从COLMAP二进制文件读取相机信息
-    返回fov和相机位姿列表
-    fov记录在cameras.bin中
-    frames记录在video.bin中
-    '''
-
-    import struct
-    vid_path = os.path.join(scene_path, "sparse", "0", "video.bin")
-    if not os.path.exists(vid_path):
-        print(f"相机位姿文件不存在: {vid_path}")
-        return None, []
-    
-    # 读取cameras.bin获取相机内参
-    cameras_path = os.path.join(scene_path, "sparse", "0", "cameras.bin")
-    if not os.path.exists(cameras_path):
-        print(f"相机内参文件不存在: {cameras_path}")
-        return None, []
-    from read_write_model import read_cameras_binary, read_images_binary
-    cameras = read_cameras_binary(cameras_path)  # 相机内参
-    images = read_images_binary(vid_path)  # 相机外参
-    
-    # 计算FOV
-    # 获取第一个相机的内参
-    first_camera = list(cameras.values())[0]
-    width, height = first_camera.width, first_camera.height
-    
-    # PINHOLE
-    fx, fy, cx, cy = first_camera.params
-    focal_length_x = fx * tar_width / width
-    focal_length_y = fy * tar_width / width
-    from utils.graphics_utils import focal2fov
-    FovY = focal2fov(focal_length_x, tar_height)
-    FovX = focal2fov(focal_length_x, tar_width)
-
-    # fov = 2 * np.arctan(width / (2 * fx))  # 水平FOV
-    
-    # 构建相机位姿列表
-    frames = []
-    # 相机外参实际就是七个数字
-    for image_id, image in images.items():
-        # 获取四元数和平移向量
-        qvec = image.qvec  # (w, x, y, z) 从世界坐标系变换到相机坐标系的刚体变换
-        tvec = image.tvec  # (x, y, z) 从世界坐标系变换到相机坐标系的刚体变换
-        
-        # 转换为旋转矩阵
-        from scipy.spatial.transform import Rotation as R
-        rot_w2c = R.from_quat([qvec[1], qvec[2], qvec[3], qvec[0]])
-        R_wc = rot_w2c.as_matrix()
-        R_cw = R_wc.T
-        t_cw = -R_cw @ tvec
-        
-        c2w_cv = np.identity(4)
-        c2w_cv[:3, :3] = R_cw
-        c2w_cv[:3, 3] = t_cw
-        
-        
-        # --- 步骤 2: 定义从 OpenCV 到 OpenGL 相机坐标系的转换矩阵 ---
-        # 这个转换在相机的局部空间中进行，翻转 Y 和 Z 轴
-        opencv_to_opengl_transform = np.array([
-            [1, 0, 0, 0],
-            [0, -1, 0, 0],
-            [0, 0, -1, 0],
-            [0, 0, 0, 1]
-        ])
-        
-        # --- 步骤 3: 将 C2W_cv 转换为 C2W_gl ---
-        # 公式: C2W_gl = C2W_cv @ OpencvToOpengl
-        transform_matrix = c2w_cv @ opencv_to_opengl_transform
-        frames.append(transform_matrix)
-
-    return FovX, FovY, frames
 
 
 
@@ -454,8 +364,11 @@ def render_pipeline(
     # Pass 2 的渲染目标：一个只带 RGB Renderbuffer 的 FBO
     # 这是我们的最终输出目标，我们直接从这里读取最终图像
     # 用 Renderbuffer 比用 Texture 更高效，因为我们不需要再对它进行采样
-    color_pass2 = ctx.renderbuffer((img_width, img_height), 3) # RGB
-    fbo_pass2 = ctx.framebuffer(color_attachments=[color_pass2])        
+    # 此时实时需要texture
+    # **将 Pass 2 的 FBO 的颜色附件也改为一个 Texture**
+    # 这样它的结果才能被后续的 Blit Pass 读取
+    texture_pass2 = ctx.texture((img_width, img_height), 4, dtype='f1') # 使用 RGBA
+    fbo_pass2 = ctx.framebuffer(color_attachments=[texture_pass2])        
     with open(os.path.join(path, 'glsl', f'postproc_vs_v{version:.1f}.glsl'), 'r', encoding="utf-8") as f:
         postproc_vert_shader = f.read()
         log_info(f"postproc_vert_shader: {postproc_vert_shader}")
@@ -473,6 +386,93 @@ def render_pipeline(
     camera = InteractiveCamera() # 创建我们的交互相机实例
     scene_dir = r"G:\Lab\NGSassist\data\bicycle"
     fov_x, fov_y, cam_poses = get_video_cam_info_from_bin(scene_dir, img_width, img_height)
+    
+    # --- 鼠标控制相关变量 ---
+    last_mouse_x = img_width / 2
+    last_mouse_y = img_height / 2
+    first_mouse = True
+    mouse_sensitivity = 0.1
+    
+    # 鼠标回调函数
+    def mouse_callback(window, xpos, ypos):
+        nonlocal last_mouse_x, last_mouse_y, first_mouse
+        
+        if first_mouse:
+            last_mouse_x = xpos
+            last_mouse_y = ypos
+            first_mouse = False
+            
+        xoffset = xpos - last_mouse_x
+        yoffset = ypos - last_mouse_y  # 修复Y轴方向
+        last_mouse_x = xpos
+        last_mouse_y = ypos
+        
+        xoffset *= mouse_sensitivity
+        yoffset *= mouse_sensitivity
+        
+        camera.yaw += xoffset
+        camera.pitch += yoffset  # 修复pitch方向
+        
+        # 限制pitch角度
+        camera.pitch = np.clip(camera.pitch, -89.0, 89.0)
+        camera.update_vectors()
+    
+    # 设置鼠标回调
+    glfw.set_cursor_pos_callback(window, mouse_callback)
+    # 隐藏鼠标光标
+    glfw.set_input_mode(window, glfw.CURSOR, glfw.CURSOR_DISABLED)
+    
+    # --- 键盘控制相关变量 ---
+    motion_state = {
+        'forward': False,
+        'backward': False,
+        'left': False,
+        'right': False,
+        'up': False,
+        'down': False,
+        'rot_left': False,
+        'rot_right': False
+    }
+    
+    # 键盘回调函数
+    def key_callback(window, key, scancode, action, mods):
+        if key == glfw.KEY_ESCAPE and action == glfw.PRESS:
+            glfw.set_window_should_close(window, True)
+        elif key == glfw.KEY_W and action == glfw.PRESS:
+            motion_state['forward'] = True
+        elif key == glfw.KEY_W and action == glfw.RELEASE:
+            motion_state['forward'] = False
+        elif key == glfw.KEY_S and action == glfw.PRESS:
+            motion_state['backward'] = True
+        elif key == glfw.KEY_S and action == glfw.RELEASE:
+            motion_state['backward'] = False
+        elif key == glfw.KEY_A and action == glfw.PRESS:
+            motion_state['left'] = True
+        elif key == glfw.KEY_A and action == glfw.RELEASE:
+            motion_state['left'] = False
+        elif key == glfw.KEY_D and action == glfw.PRESS:
+            motion_state['right'] = True
+        elif key == glfw.KEY_D and action == glfw.RELEASE:
+            motion_state['right'] = False
+        elif key == glfw.KEY_SPACE and action == glfw.PRESS:
+            motion_state['down'] = True
+        elif key == glfw.KEY_SPACE and action == glfw.RELEASE:
+            motion_state['down'] = False
+        elif key == glfw.KEY_LEFT_SHIFT and action == glfw.PRESS:
+            motion_state['up'] = True
+        elif key == glfw.KEY_LEFT_SHIFT and action == glfw.RELEASE:
+            motion_state['up'] = False
+        elif key == glfw.KEY_Q and action == glfw.PRESS:
+            motion_state['rot_left'] = True
+        elif key == glfw.KEY_Q and action == glfw.RELEASE:
+            motion_state['rot_left'] = False
+        elif key == glfw.KEY_E and action == glfw.PRESS:
+            motion_state['rot_right'] = True
+        elif key == glfw.KEY_E and action == glfw.RELEASE:
+            motion_state['rot_right'] = False
+    
+    # 设置键盘回调
+    glfw.set_key_callback(window, key_callback)
     aspect_ratio = img_width / img_height
     znear, zfar = 0.01, 100.0
     projection_matrix = build_projection_matrix(fov_x, fov_y, aspect_ratio, znear, zfar)
@@ -530,6 +530,16 @@ def render_pipeline(
     last_time = glfw.get_time()
     frame_count = 0
     last_fps_output_time = last_time  # 记录上次FPS输出的时间
+    
+    # 打印控制说明
+    print("\n=== 3D Gaussian Splatting 实时渲染控制 ===")
+    print("鼠标: 控制视角旋转")
+    print("W/S: 前进/后退")
+    print("A/D: 左移/右移")
+    print("空格/Shift: 下降/上升")
+    print("Q/E: 左转/右转")
+    print("ESC: 退出程序")
+    print("==========================================\n")
     while not glfw.window_should_close(window):
         # --- 1. 事件和时间处理 ---
         glfw.poll_events()
@@ -608,6 +618,7 @@ def render_pipeline(
         ctx.screen.use() # 激活窗口的默认帧缓冲
         ctx.clear(0.0, 0.0, 0.0, 1.0)
         ctx.disable(moderngl.DEPTH_TEST)
+        ################## 基元分析改成了pass1，正常是pass2 #########################################
         texture_pass1.use(location=0) # 假设 fbo_pass2 的输出是 texture_pass2
         blit_prog['u_texture'].value = 0
         blit_vao.render(moderngl.TRIANGLE_STRIP)
@@ -638,10 +649,9 @@ def render_pipeline(
 
 if __name__ == "__main__":
     dir = ROOT_DIR
-    wh = [[100, 100], [616, 409], [1920, 1080]]
-    wh_idx = 1
+    wh = [[100, 100], [616, 409], [1920, 1080], [800, 800]]
     render_pipeline(
-        data_dir=dir,
+        data_dir=point_cloud_dir,
         output_dir=dir,
         num_points_to_keep=NUM_POINTS_TO_KEEP, # 10_000_000
         opacity_threshold=None,
